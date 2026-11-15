@@ -1,4 +1,4 @@
-"""Business logic: batch ingestion rules and ambiguity-aware queries.
+"""Business logic: batch ingestion rules, prefix purges, ambiguity-aware queries.
 
 No web-framework imports here -- the layer is plain Python so it can be unit
 tested directly against SQLite.
@@ -9,6 +9,7 @@ from __future__ import annotations
 import sqlite3
 import uuid
 from dataclasses import dataclass
+from datetime import datetime
 
 from .db import read_transaction, write_transaction
 from .timeline import Record, analyze_timeline
@@ -36,6 +37,28 @@ class UnresolvableTimelineError(IngestionError):
     status_code = 422
 
 
+class PurgedSampleIdError(IngestionError):
+    """Batch carries sample ids at or below the purge watermark."""
+
+    status_code = 409
+
+
+class PurgeError(IngestionError):
+    """Base for errors raised by the purge operation itself."""
+
+
+class PurgeRegressionError(PurgeError):
+    """Truncation number does not move the purge watermark forward."""
+
+    status_code = 409
+
+
+class WarehouseInfeasibleError(PurgeError):
+    """Stored records admit no legal timeline (should never happen)."""
+
+    status_code = 500
+
+
 @dataclass
 class IngestionResult:
     batch_ref: str
@@ -45,11 +68,36 @@ class IngestionResult:
     record_count: int
 
 
+@dataclass
+class PurgeResult:
+    watermark: int
+    deleted_count: int
+    boundary_sample_id: int | None
+    boundary_utc: str | None  # ISO-8601, offset-aware
+
+
 def _all_rows(conn: sqlite3.Connection) -> dict[int, sqlite3.Row]:
     rows = conn.execute(
         "SELECT sample_id, local_time, pass_count FROM records"
     ).fetchall()
     return {row["sample_id"]: row for row in rows}
+
+
+def _purge_state(
+    conn: sqlite3.Connection,
+) -> tuple[int, int | None, datetime | None]:
+    """(watermark, boundary sample id, boundary UTC) from the singleton row."""
+
+    row = conn.execute(
+        "SELECT watermark, boundary_sample_id, boundary_utc "
+        "FROM purge_state WHERE id = 1"
+    ).fetchone()
+    boundary_utc = (
+        datetime.fromisoformat(row["boundary_utc"])
+        if row["boundary_utc"] is not None
+        else None
+    )
+    return row["watermark"], row["boundary_sample_id"], boundary_utc
 
 
 def _write_audit(
@@ -82,6 +130,9 @@ def ingest_batch(
     """Atomically accept or reject one CSV batch.
 
     Rules:
+      * any sample id at or below the purge watermark -> whole batch
+        rejected (409): purged rows are gone, so even content comparison
+        is impossible;
       * same sample id + same content -> idempotent skip (accepted once);
       * same sample id + different content -> whole batch rejected (409);
       * merged set admits no legal timeline -> whole batch rejected (422).
@@ -105,6 +156,19 @@ def ingest_batch(
             # Full-table snapshot: feasibility must hold across *all*
             # warehoused records, not only ids touched by this batch.
             existing = _all_rows(tx)
+            watermark, _, boundary_utc = _purge_state(tx)
+
+            # 0) purged-prefix check: ids at or below the watermark can never
+            #    come back, whatever their content
+            purged_ids = sorted(
+                {rec.sample_id for rec in records if rec.sample_id <= watermark}
+            )
+            if purged_ids:
+                raise _Rollback(PurgedSampleIdError(
+                    f"sample id(s) {purged_ids} are at or below the purge "
+                    f"watermark {watermark}; purged readings are settled and "
+                    f"cannot be re-ingested"
+                ))
 
             # 1) conflict check against already-warehoused records
             for rec in records:
@@ -139,7 +203,9 @@ def ingest_batch(
                 new_records.append(rec)
                 known_keys.add(rec.key())
 
-            if not analyze_timeline(merged).feasible:
+            if not analyze_timeline(
+                merged, earliest_before=boundary_utc
+            ).feasible:
                 raise _Rollback(UnresolvableTimelineError(
                     "no legal timeline: sample ids must map to strictly "
                     "increasing UTC instants across the DST transition"
@@ -174,11 +240,106 @@ def ingest_batch(
     return accepted_result
 
 
+def purge_prefix(conn: sqlite3.Connection, truncate_upto: int) -> PurgeResult:
+    """Delete every raw reading with ``sample_id <= truncate_upto``.
+
+    The watermark only moves forward.  The purge keeps a timeline boundary --
+    the earliest candidate UTC of the last purged sample that really existed
+    -- so the surviving records keep their un-purged determined/pending
+    verdicts and later backfills face exactly the un-purged constraints, even
+    when the truncation point sits inside the repeated wall-clock hour or no
+    readings remain at all.
+
+    Everything (delete, boundary update, audit row) commits in one
+    BEGIN IMMEDIATE transaction: a failure leaves no partial purge, and a
+    concurrent backfill either runs entirely before or entirely after.
+    """
+
+    with write_transaction(conn) as tx:
+        watermark, boundary_id, boundary_utc = _purge_state(tx)
+        if truncate_upto <= watermark:
+            raise PurgeRegressionError(
+                f"truncation number {truncate_upto} does not move the purge "
+                f"watermark forward (current watermark {watermark})"
+            )
+
+        rows = tx.execute(
+            "SELECT sample_id, local_time, pass_count FROM records "
+            "ORDER BY sample_id"
+        ).fetchall()
+        records = [
+            Record(
+                sample_id=row["sample_id"],
+                local_time=row["local_time"],
+                pass_count=row["pass_count"],
+            )
+            for row in rows
+        ]
+
+        # Verdicts are computed against the *current* boundary, so the new
+        # boundary value equals the one the un-purged warehouse would have.
+        analysis = analyze_timeline(records, earliest_before=boundary_utc)
+        if records and not analysis.feasible:  # defensive: ingestion guards this
+            raise WarehouseInfeasibleError(
+                "stored records admit no legal timeline; purge aborted"
+            )
+
+        victims = [r for r in records if r.sample_id <= truncate_upto]
+        if victims:
+            last = victims[-1]  # rows are ordered by sample_id
+            boundary_id = last.sample_id
+            boundary_utc = analysis.earliest[last.sample_id]
+
+        tx.execute(
+            "DELETE FROM records WHERE sample_id <= ?", (truncate_upto,)
+        )
+        boundary_utc_text = (
+            boundary_utc.isoformat() if boundary_utc is not None else None
+        )
+        tx.execute(
+            "UPDATE purge_state SET watermark = ?, boundary_sample_id = ?, "
+            "boundary_utc = ? WHERE id = 1",
+            (truncate_upto, boundary_id, boundary_utc_text),
+        )
+        tx.execute(
+            "INSERT INTO purge_audit "
+            "(watermark, deleted_count, boundary_sample_id, boundary_utc) "
+            "VALUES (?, ?, ?, ?)",
+            (truncate_upto, len(victims), boundary_id, boundary_utc_text),
+        )
+
+    return PurgeResult(
+        watermark=truncate_upto,
+        deleted_count=len(victims),
+        boundary_sample_id=boundary_id,
+        boundary_utc=boundary_utc_text,
+    )
+
+
+def purge_status(conn: sqlite3.Connection) -> dict:
+    """Current watermark/boundary plus the committed purge history."""
+
+    with read_transaction(conn) as tx:
+        watermark, boundary_id, boundary_utc = _purge_state(tx)
+        rows = tx.execute(
+            "SELECT watermark, deleted_count, boundary_sample_id, "
+            "boundary_utc, created_at FROM purge_audit ORDER BY id"
+        ).fetchall()
+    return {
+        "watermark": watermark,
+        "boundary_sample_id": boundary_id,
+        "boundary_utc": boundary_utc.isoformat() if boundary_utc else None,
+        "history": [dict(row) for row in rows],
+    }
+
+
 def query_traffic(conn: sqlite3.Connection) -> dict:
     """Return determined passenger details plus the still-pending sample ids.
 
     Everything is computed from one read snapshot in a single transaction, so
     a concurrent backfill can never produce half-new, half-stale verdicts.
+    The purge state is read in the same snapshot, so the retained boundary is
+    always the one that matches the rows being analyzed.
     """
 
     with read_transaction(conn) as tx:
@@ -186,6 +347,7 @@ def query_traffic(conn: sqlite3.Connection) -> dict:
             "SELECT sample_id, local_time, pass_count FROM records "
             "ORDER BY sample_id"
         ).fetchall()
+        watermark, _, boundary_utc = _purge_state(tx)
 
     records = [
         Record(
@@ -195,7 +357,7 @@ def query_traffic(conn: sqlite3.Connection) -> dict:
         )
         for row in rows
     ]
-    result = analyze_timeline(records)
+    result = analyze_timeline(records, earliest_before=boundary_utc)
     if not result.feasible:  # defensive: ingestion never commits an infeasible set
         return {
             "total_records": len(records),
@@ -204,6 +366,7 @@ def query_traffic(conn: sqlite3.Connection) -> dict:
             "details": [],
             "pending_sample_ids": [],
             "pending": [],
+            "purge_watermark": watermark,
             "error": "stored records admit no legal timeline; contact data steward",
         }
 
@@ -239,6 +402,7 @@ def query_traffic(conn: sqlite3.Connection) -> dict:
         "details": details,
         "pending_sample_ids": [p["sample_id"] for p in pending],
         "pending": pending,
+        "purge_watermark": watermark,
     }
 
 

@@ -93,12 +93,22 @@ class TimelineResult:
         return self.earliest[sample_id] == self.latest[sample_id]
 
 
-def analyze_timeline(records: list[Record]) -> TimelineResult:
+def analyze_timeline(
+    records: list[Record],
+    earliest_before: datetime | None = None,
+) -> TimelineResult:
     """Compute feasible bounds for every sample id.
 
     The input may contain duplicate sample ids; the caller (service layer) is
     responsible for deciding whether duplicates conflict.  Here every sample
     id is evaluated with its own candidate set.
+
+    ``earliest_before`` seeds the forward pass: the first record must pick a
+    UTC strictly after it.  The service layer uses this to stand in for a
+    purged prefix -- the prefix's whole influence on the remaining suffix is
+    the earliest UTC of its last sample, so seeding with that value reproduces
+    the un-purged verdicts (and backfill feasibility) exactly.  The backward
+    pass never looks behind the first record, so it needs no seed.
     """
 
     ordered = sorted(records, key=lambda r: r.sample_id)
@@ -107,7 +117,7 @@ def analyze_timeline(records: list[Record]) -> TimelineResult:
 
     # Forward pass: smallest candidate strictly greater than the previous one.
     earliest: dict[int, datetime] = {}
-    prev: datetime | None = None
+    prev: datetime | None = earliest_before
     feasible = True
     for sid in ids:
         chosen = None

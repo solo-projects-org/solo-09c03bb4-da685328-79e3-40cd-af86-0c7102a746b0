@@ -24,6 +24,34 @@ CREATE TABLE IF NOT EXISTS batch_audit (
     record_count INTEGER NOT NULL,
     created_at  TEXT    NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
 );
+
+-- Singleton row (id = 1): how far the settled prefix has been purged.
+--   watermark           every sample_id <= watermark has been purged; later
+--                       batches containing such ids are rejected whole.
+--   boundary_sample_id  largest purged sample id that actually existed in the
+--                       warehouse (NULL when nothing real was ever purged).
+--   boundary_utc        its earliest candidate UTC (ISO-8601, offset-aware);
+--                       seeds every later timeline analysis so the remaining
+--                       records keep their un-purged verdicts.
+CREATE TABLE IF NOT EXISTS purge_state (
+    id                 INTEGER PRIMARY KEY CHECK (id = 1),
+    watermark          INTEGER NOT NULL,
+    boundary_sample_id INTEGER,
+    boundary_utc       TEXT
+);
+
+-- One row per committed purge, written inside the purge transaction itself:
+-- a failed purge therefore leaves neither partial deletes nor an audit row.
+CREATE TABLE IF NOT EXISTS purge_audit (
+    id                 INTEGER PRIMARY KEY AUTOINCREMENT,
+    watermark          INTEGER NOT NULL,
+    deleted_count      INTEGER NOT NULL,
+    boundary_sample_id INTEGER,
+    boundary_utc       TEXT,
+    created_at         TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+);
+
+INSERT OR IGNORE INTO purge_state (id, watermark) VALUES (1, 0);
 """
 
 
